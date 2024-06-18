@@ -16,7 +16,8 @@ from typing import Tuple
 from datetime import datetime
 import shutil
 from net.CalibrationNet import get_model
-from dataset import TrainDataset as CalibDataset, run_stat
+# from dataset import TrainDataset as run_stat
+from calibration_script.dataset import DatasetNuscenesCalibNet
 from utils import count_parameters, inv_transform_vectorized, phi_to_transformation_matrix_vectorized
 
 # set seeds
@@ -29,7 +30,7 @@ DEVICE = 'cuda'
 
 
 class Loss(Module):
-    def __init__(self, dataset: CalibDataset, reduction: str = 'mean',
+    def __init__(self, dataset: DatasetNuscenesCalibNet, reduction: str = 'mean',
                  alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0):
         super(Loss, self).__init__()
         self.dataset = dataset
@@ -61,12 +62,11 @@ class Loss(Module):
             T_ = T[i]
             T_recalib_ = T_recalib[i]
             # Reflectance > 0
-            pts3d = scan[scan[:, 3] > 0, :]
-            pts3d[:, 3] = 1
+            pts3d = scan
             min_pts.append(pts3d.shape[0])
             # project
-            pts3d_cam = T_.mm(pts3d.t()).t().unsqueeze(0)
-            pts3d_cam_recalib = T_recalib_.mm(pts3d.t()).t().unsqueeze(0)
+            pts3d_cam = T_.mm(pts3d).t().unsqueeze(0)
+            pts3d_cam_recalib = T_recalib_.mm(pts3d).t().unsqueeze(0)
             pts3d_cam_l.append(pts3d_cam)
             pts3d_cam_recalib_l.append(pts3d_cam_recalib)
 
@@ -188,19 +188,27 @@ def validation(model: Module, loss_fn: Loss, loader: DataLoader,
 
 def arg_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', type=str, default='/home/username/dataset/KITTI/', help='KITTI dataset root directory.')
+    parser.add_argument('--data_folder', type=str, default='/mnt/SSD1/yonglin/datasets/nuscenes', help='KITTI dataset root directory.')
+    parser.add_argument('--prepared_path', type=str, default='/mnt/SSD1/yonglin/datasets/prepared_nuscenes_trainval/prepared_data.h5', help='KITTI dataset root directory.')
+    parser.add_argument('--nuscenes_version', type=str, default='v1.0-trainval', help='KITTI dataset root directory.')
+    parser.add_argument('--modality', type=str, default='radar', help='KITTI dataset root directory.')
+    parser.add_argument('--max_t', type=float, default=0.25, help='Batch size.')
+    parser.add_argument('--max_r', type=float, default=10, help='Batch size.')
+    parser.add_argument('--max_depth', type=int, default=200, help='Batch size.')
+    parser.add_argument('--downsample_scale', type=int, default=4, help='Batch size.')
+    parser.add_argument('--y_cutoff', type=int, default=33, help='Batch size.')
     parser.add_argument('--batch', type=int, default=2, help='Batch size.')
     parser.add_argument('--ckpt', type=str, help='Path to the saved model in saved folder.')
     parser.add_argument('--ckpt_no_lr', action='store_true', help='Ignore lr in the checkpoint.')
     parser.add_argument('--model', type=int, default=1, help='Select model variant to test.')
     parser.add_argument('--rotation_offsest', type=float, default=10.0, help='Random rotation error range.')
-    parser.add_argument('--translation_offsest', type=float, default=0.2, help='Random translation error range.')
-    parser.add_argument('--epoch', type=int, default=50, help='Epochs to train.')
+    parser.add_argument('--translation_offsest', type=float, default=0.25, help='Random translation error range.')
+    parser.add_argument('--epoch', type=int, default=70, help='Epochs to train.')
     parser.add_argument('--lr', type=float, default=5e-4, help='Model learning rate.')
-    parser.add_argument('--patience', type=int, default=6, help='Patience for reducing lr.')
+    parser.add_argument('--patience', type=int, default=3, help='Patience for reducing lr.')
     parser.add_argument('--lr_factor', type=float, default=0.5, help='Factor for reducing lr.')
-    parser.add_argument('--loss_a', type=float, default=1.0, help='Loss factor for rotation & translation errors.')
-    parser.add_argument('--loss_b', type=float, default=1.0, help='Loss factor for point cloud center errors.')
+    parser.add_argument('--loss_a', type=float, default=1.25, help='Loss factor for rotation & translation errors.')
+    parser.add_argument('--loss_b', type=float, default=1.75, help='Loss factor for point cloud center errors.')
     parser.add_argument('--loss_c', type=float, default=1.0, help='Loss factor for point cloud errors.')
     parser.add_argument('--exp_name', type=str, default=f'exp_{datetime.now().strftime("%H%M_%d%m%Y")}',
                         help='Loss factor for translation errors.')
@@ -214,11 +222,11 @@ if __name__ == '__main__':
     print(args)
 
     # calculating dataset statistics
-    if args.stat:
-        train_ds = CalibDataset(path=args.dataset, mode='train')
-        train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
-        run_stat(train_loader)
-        exit(0)
+    # if args.stat:
+    #     train_ds = CalibDataset(path=args.dataset, mode='train')
+    #     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4, pin_memory=True)
+    #     run_stat(train_loader)
+    #     exit(0)
 
     # creating dirs
     result_base = Path('.').absolute().parent.joinpath('results').joinpath(args.exp_name)
@@ -275,10 +283,17 @@ if __name__ == '__main__':
     valid_loss = 9999
 
     # create data loaders
-    train_ds = CalibDataset(path=args.dataset, mode='train',
-                            rotation_offset=args.rotation_offsest, translation_offset=args.translation_offsest)
-    val_ds = CalibDataset(path=args.dataset, mode='val',
-                          rotation_offset=args.rotation_offsest, translation_offset=args.translation_offsest)
+    # train_ds = CalibDataset(path=args.dataset, mode='train',
+    #                         rotation_offset=args.rotation_offsest, translation_offset=args.translation_offsest)
+    # val_ds = CalibDataset(path=args.dataset, mode='val',
+    #                       rotation_offset=args.rotation_offsest, translation_offset=args.translation_offsest)
+    val_split = 'val'
+    if args.nuscenes_version == "v1.0-mini":
+        val_split = 'test'
+    train_ds = DatasetNuscenesCalibNet(args.prepared_path, args.data_folder, 'train', 
+                                            args.max_t, args.max_r, args.max_depth, args.downsample_scale, args.y_cutoff, nuscenes_version=args.nuscenes_version, modality=args.modality)
+    val_ds = DatasetNuscenesCalibNet(args.prepared_path, args.data_folder, val_split, 
+                                            args.max_t, args.max_r, args.max_depth, args.downsample_scale, args.y_cutoff, nuscenes_version=args.nuscenes_version, modality=args.modality)
     train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=4,
                               pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=True, num_workers=4,

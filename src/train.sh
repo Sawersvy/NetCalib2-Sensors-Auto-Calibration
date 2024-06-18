@@ -2,10 +2,10 @@
 
 # use KITTI root directory here as mentioned in the dataset section of README
 # https://github.com/simonwu53/NetCalib2-Sensors-Auto-Calibration#2-dataset
-KITTI_DIR="/home/username/dataset/KITTI/"
+KITTI_DIR="/mnt/HDD7/yonglin/data/kitti-raw"
 
 # activate virtual env if needed
-source /home/username/Projects/venvs/pytorch/bin/activate
+# source /home/username/Projects/venvs/pytorch/bin/activate
 
 python train.py \
 --dataset ${KITTI_DIR} \

@@ -154,6 +154,7 @@ class KITTIDataset(Dataset):
     def __init__(self, mode: Literal['train', 'test', 'val'] = 'train',
                  database: str = '/home/shanwu/dataset/KITTI/',
                  selected_date: str = '2011_09_26',
+                 selected_drive: str = '0027',
                  mean: Tuple[float, float, float] = (0.485, 0.456, 0.406),
                  std: Tuple[float, float, float] = (0.229, 0.224, 0.225),
                  crop_size: Tuple[int, int] = (352, 1216),
@@ -170,12 +171,13 @@ class KITTIDataset(Dataset):
         # get dataset base
         mode = mode.lower()
         assert mode in ('train', 'test', 'val'), "mode should be one of the 'train', 'test', 'val'."
-        self.kitti_base = Path(database).joinpath(mode)
+        # self.kitti_base = Path(database).joinpath(mode)
+        self.kitti_base = Path(database)
         self.date = selected_date
         self.pred_save_path = self.kitti_base.joinpath(self.date)
         # get drive numbers in dataset
         self.drives = [i.name.split('_')[4] for i in self.pred_save_path.glob(f'{self.date}_drive_*_sync')]
-
+        print(self.pred_save_path)
         # data dict
         self.loaders = {}
         self.kitti_loaders = {}
@@ -268,9 +270,9 @@ def preprocess_depth_data(dataset: KITTIDataset, method_for_cam_depth: Optional,
         image_c_path = drive_path.joinpath('image_c')
         image_l_path = drive_path.joinpath('image_l')
 
-        if image_c_path.exists() and image_l_path.exists():
-            print(f'Drive {drive} seems already processed. Skip.')
-            continue
+        # if image_c_path.exists() and image_l_path.exists():
+        #     print(f'Drive {drive} seems already processed. Skip.')
+        #     continue
         if len(dataset.current_kitti_loader.cam2_files) != len(dataset.current_kitti_loader.velo_files):
             print(f'Drive {drive} has mismatch cam2 files and velo files! Fixing...')
             kitti_loader = dataset.current_kitti_loader
@@ -285,12 +287,12 @@ def preprocess_depth_data(dataset: KITTIDataset, method_for_cam_depth: Optional,
 
         # data loader and progress bar
         loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.n_workers, pin_memory=True, drop_last=False)
-        pbar = tqdm(enumerate(loader))
-        pbar.set_description(f'[Drive {drive} ({i + 1}/{len(dataset.drives)})]')
-
+        # pbar = tqdm(enumerate(loader))
+        # pbar.set_description(f'[Drive {drive} ({i + 1}/{len(dataset.drives)})]')
+        # print()
         # creating depth maps
         with torch.no_grad():
-            for j, sample in pbar:
+            for j, sample in enumerate(loader):
                 # get data
                 img2 = sample['image2'].cuda()
                 img3 = sample['image3'].cuda()
@@ -347,8 +349,8 @@ def arg_parser():
     parser.add_argument('--data_path', type=str, help='path to the data', required=True)
     parser.add_argument('--n_workers', type=int, help='number of workers for data loader', default=6)
     parser.add_argument('--split', type=str, choices=['train', 'val', 'test'], help='train test val split', default='train')
-    parser.add_argument('--rotation_offset', type=float, help='rotation offset (degrees) used to create un-calibrated dataset', default=2)
-    parser.add_argument('--translation_offset', type=float, help='translation offset (meters) used to create un-calibrated dataset', default=0.2)
+    parser.add_argument('--rotation_offset', type=float, help='rotation offset (degrees) used to create un-calibrated dataset', default=10)
+    parser.add_argument('--translation_offset', type=float, help='translation offset (meters) used to create un-calibrated dataset', default=0.25)
     parser.add_argument('--no_cam_depth', action='store_true', help='Only pre-processing the LiDAR projection maps.')
     return parser.parse_args()
 
@@ -372,6 +374,83 @@ if __name__ == '__main__':
         # output: depth_c, Tensor, camera depth map, value range [0, 1]
         # ------------
         # func_for_cam_depth: Callable = SomeMethodOfYourChoice()
+        
+        def func_for_cam_depth(img2: torch.Tensor, img3: torch.Tensor) -> torch.Tensor:
+            """
+            Generate a camera depth map from the left and right images using SGBM algorithm.
+
+            Args:
+            img2 (torch.Tensor): Left color image from KITTI dataset, loaded by PyTorch DataLoader
+            img3 (torch.Tensor): Right color image from KITTI dataset, loaded by PyTorch DataLoader
+
+            Returns:
+            torch.Tensor: Camera depth map, value range [0, 1]
+            """
+            # Convert PyTorch tensors to NumPy arrays
+            img2_np = img2.cpu().numpy().squeeze().transpose(1, 2, 0)  # Convert from (C, H, W) to (H, W, C)
+            img3_np = img3.cpu().numpy().squeeze().transpose(1, 2, 0)  # Convert from (C, H, W) to (H, W, C)
+            
+            # Ensure the images have the same size
+            if img2_np.shape != img3_np.shape:
+                raise ValueError("Left and right images must have the same size")
+            
+            # # Convert to grayscale
+            # img2_gray = cv2.cvtColor(img2_np, cv2.COLOR_RGB2GRAY)
+            # img3_gray = cv2.cvtColor(img3_np, cv2.COLOR_RGB2GRAY)
+            img2_gray = img2_np
+            img3_gray = img3_np
+            
+            
+            # Ensure the images are 8-bit
+            if img2_gray.dtype != np.uint8:
+                img2_gray = (img2_gray * 255).astype(np.uint8)
+            if img3_gray.dtype != np.uint8:
+                img3_gray = (img3_gray * 255).astype(np.uint8)
+            
+            # SGBM Parameters
+            min_disp = 0
+            num_disp = 160  # Must be divisible by 16
+            block_size = 5
+            uniqueness_ratio = 15
+            speckle_window_size = 0
+            speckle_range = 2
+            disp12_max_diff = 1
+            pre_filter_cap = 63
+            P1 = 216
+            P2 = 864
+            Lambda = 8000
+            SigmaColor = 12
+            
+            # Create SGBM object
+            stereo = cv2.StereoSGBM_create(
+                minDisparity=min_disp,
+                numDisparities=num_disp,
+                blockSize=block_size,
+                P1=P1,
+                P2=P2,
+                disp12MaxDiff=disp12_max_diff,
+                uniquenessRatio=uniqueness_ratio,
+                speckleWindowSize=speckle_window_size,
+                speckleRange=speckle_range,
+                preFilterCap=pre_filter_cap
+            )
+            
+            # Compute disparity map
+            disparity_map = stereo.compute(img2_gray, img3_gray).astype(np.float32) / 16.0
+            
+            # Apply a mean filter for smoothing (Lambda and SigmaColor effect)
+            smooth_disparity = cv2.GaussianBlur(disparity_map, (15, 15), SigmaColor)
+            
+            # Normalize the disparity map to the range [0, 1]
+            # disparity_map = (disparity_map - min_disp) / num_disp
+            # print(disparity_map)
+            # disparity_map = np.clip(disparity_map, 0, 1)  # Ensure the values are within [0, 1]
+            
+            # Convert the disparity map to a PyTorch tensor
+            # depth_c = torch.from_numpy(disparity_map).float()
+            
+            return disparity_map
+        
         ...
         assert func_for_cam_depth is not None, \
             'You need to add your algorithm above for generating camera depth maps. ' \
@@ -379,7 +458,7 @@ if __name__ == '__main__':
             'a much complicated neural network based algorithm.'
 
     # load dataset
-    dataset = KITTIDataset(mode=args.split)
+    dataset = KITTIDataset(database=args.data_path, mode=args.split)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.n_workers, pin_memory=True, drop_last=True)
 
     # tasks

@@ -12,7 +12,9 @@ from tqdm import tqdm
 from pathlib import Path
 from typing import Tuple, Optional, List
 from net.CalibrationNet import get_model
-from dataset import EvalDataset as CalibDataset
+# from dataset import EvalDataset as CalibDataset
+from calibration_script.dataset import DatasetNuscenesCalibNet, lidar_project_depth
+
 from utils import count_parameters, inv_transform_vectorized, phi_to_transformation_matrix_vectorized, \
     lidar_projection, inv_transform, phi_to_transformation_matrix, merge_color_img_with_depth
 
@@ -24,9 +26,20 @@ torch.manual_seed(SEED)
 
 DEVICE = 'cuda'
 
+def lidar_project_depth_batch(pc, calib, img_shape, downsample_scale=1.0, y_cutoff=0,visual = False):
+    depth_img_out = []
+    for idx in range(pc.shape[0]):
+        # print(pc[idx].transpose(0, 1).shape)
+        # print(pc[idx].shape)
+        depth_img, _ = lidar_project_depth(pc[idx].transpose(0, 1), calib[idx], img_shape, downsample_scale=downsample_scale, y_cutoff=y_cutoff,visual=visual)
+        depth_img = depth_img.to(DEVICE)
+        depth_img_out.append(depth_img)
 
+    depth_img_out = torch.stack(depth_img_out)
+    # depth_img_out = F.interpolate(depth_img_out, size=[384, 384], mode = 'bilinear', align_corners=False)
+    return depth_img_out
 class Loss(Module):
-    def __init__(self, dataset: CalibDataset, reduction: str = 'mean',
+    def __init__(self, dataset: DatasetNuscenesCalibNet, reduction: str = 'mean',
                  alpha: float = 0.5, beta: float = 1, gamma: float = 0.5, cache: int = 60000):
         super(Loss, self).__init__()
         self.dataset = dataset
@@ -58,11 +71,11 @@ class Loss(Module):
             T_ = T[i]
             T_recalib_ = T_recalib[i]
             # Reflectance > 0
-            pts3d = scan[scan[:, 3] > 0, :]
-            pts3d[:, 3] = 1
+            pts3d = scan
+            # pts3d[:, 3] = 1
             # project
-            pts3d_cam = T_.mm(pts3d.t()).t()[:self.cache, :].unsqueeze(0)
-            pts3d_cam_recalib = T_recalib_.mm(pts3d.t()).t()[:self.cache, :].unsqueeze(0)
+            pts3d_cam = T_.mm(pts3d).t()[:self.cache, :].unsqueeze(0)
+            pts3d_cam_recalib = T_recalib_.mm(pts3d).t()[:self.cache, :].unsqueeze(0)
             pts3d_cam_l.append(pts3d_cam)
             pts3d_cam_recalib_l.append(pts3d_cam_recalib)
         pts3d_cam = torch.cat(pts3d_cam_l, dim=0)
@@ -191,15 +204,10 @@ def run_visualization(model: Module, loader: DataLoader, loss_fn: Loss, fout: Op
     return
 
 
-def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Loss, offsets: List[Tuple[float, float]], fout: Optional[str] = None) -> None:
-    if fout is not None:
-        pout = Path(fout).joinpath('model_inference.avi')
-        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-        writer = cv2.VideoWriter(pout.as_posix(), fourcc, 10.0, (1242, 375*3))
-
-    cv2.namedWindow('Visualization', flags=cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Visualization', 1250, 380*3)
-
+def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Module, offsets: List[Tuple[float, float]], fout: Optional[str] = None) -> None:
+    output_dir = Path(fout) if fout is not None else Path('./output')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
     running_loss = 0
     running_mean = 0
     running_time = 0
@@ -209,17 +217,18 @@ def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Loss, offse
     pbar = tqdm(loader)
     for m in models:
         m.eval()
-
+    downsample_scale=4
+    y_cutoff=33 
     with torch.no_grad():
         i = 0
         for i, sample in enumerate(pbar):
-            cam2_d, velo_d, gt_err, gt_err_norm, cam2, velo, T, P = sample[0].cuda(), sample[1].cuda(), sample[2], sample[3].cuda(), \
+            cam2_d, velo_d, gt_err, gt_err_norm, cam2, velo, T, K = sample[0].cuda(), sample[1].cuda(), sample[2], sample[3].cuda(), \
                                                               sample[4].cuda(), sample[5].cuda(), sample[6].cuda(), sample[7].cuda()
             # prepare matrix
             cam2 = cam2[0].cpu().numpy()
-            velo_np = velo[0].cpu().numpy()
+            velo_np = velo[0]
             T_np = T[0].cpu().numpy()
-            P = P[0].cpu().numpy()
+            K = K[0]
             gt_err = gt_err.numpy()[0]
             T_err = phi_to_transformation_matrix(gt_err)
             T_composed = T_err @ T_np
@@ -232,13 +241,13 @@ def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Loss, offse
             T_est_final = np.eye(4, dtype=np.float32)
             for m, (rot_offset, trans_offset) in zip(models, offsets):
                 pred_r, pred_t = m(velo_d, cam2_d)
-                pred_r_real, pred_t_real = loader.dataset.destandardize(pred_r.detach().cpu().numpy(), pred_t.detach().cpu().numpy(),
+                pred_r_real, pred_t_real = loader.dataset.test_destandardize(pred_r.detach().cpu().numpy(), pred_t.detach().cpu().numpy(),
                                                                         rot_offset=rot_offset, trans_offset=trans_offset)
                 T_est = phi_to_transformation_matrix(np.concatenate([pred_r_real[0], pred_t_real[0]]))
                 T_est_final = T_est @ T_est_final
                 T_patch = inv_transform(T_est)
                 phi = T_patch @ phi
-                velo_d = torch.from_numpy(lidar_projection(velo_np, phi, P, cam2.shape[:2], crop=cam2_d.shape[2:])).unsqueeze(0).unsqueeze(0).cuda()
+                velo_d, _ = lidar_project_depth(velo_np, K, cam2.shape[1:3], downsample_scale, y_cutoff)
             T_recalib = phi.copy()
 
             # timer stop
@@ -254,33 +263,58 @@ def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Loss, offse
             rot_err[i] = np.abs(pred_r_real[0]-gt_splits[0]).mean(axis=0)
             trans_err[i] = np.abs(pred_t_real[0]-gt_splits[1]).mean(axis=0)
 
-            # lidar projections -- raw errors
-            uncalib = lidar_projection(velo_np, T_composed, P, cam2.shape[:2])
+            # # lidar projections -- raw errors
+            # uncalib = lidar_projection(velo_np, T_composed, P, cam2.shape[:2])
+            # # lidar projections -- model predictions
+            # recalib = lidar_projection(velo_np, T_recalib, P, cam2.shape[:2])
+            # # lidar projections -- ground truth
+            # calibgt = lidar_projection(velo_np, T_np, P, cam2.shape[:2])
+            
+            T_composed = torch.from_numpy(T_composed).cuda()
+            T_recalib = torch.from_numpy(T_recalib).cuda()
+            T_np = torch.from_numpy(T_np).cuda()
+            uncalib_pc = torch.mm(T_composed, velo_np)
+            recalib_pc = torch.mm(T_recalib, velo_np)
+            calibgt_pc = torch.mm(T_np, velo_np)
+            
+            
+            uncalib, _ = lidar_project_depth(uncalib_pc, K, cam2.shape[1:3], downsample_scale, y_cutoff)
             # lidar projections -- model predictions
-            recalib = lidar_projection(velo_np, T_recalib, P, cam2.shape[:2])
+            recalib, _ = lidar_project_depth(recalib_pc, K, cam2.shape[1:3], downsample_scale, y_cutoff)
             # lidar projections -- ground truth
-            calibgt = lidar_projection(velo_np, T_np, P, cam2.shape[:2])
+            calibgt, _ = lidar_project_depth(calibgt_pc, K, cam2.shape[1:3], downsample_scale, y_cutoff)
 
             # calculate running msee
             running_msee += np.linalg.norm((T_est_final - T_err))
 
             # show img
-            uncalib = cv2.putText(merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), uncalib),
-                                  'Input', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
-            recalib = cv2.putText(merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), recalib),
-                                  'Pred', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
-            calibgt = cv2.putText(merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), calibgt),
-                                  'GT', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
-            img = np.concatenate([uncalib, recalib, calibgt], axis=0)
-            cv2.imshow('Visualization', img)
-            if fout is not None:
-                writer.write(img)
-            key = cv2.waitKey(int(1 / 60 * 1000))
-            if (key & 0xFF == ord('q')) or (key & 0xFF == 27):
-                break
+            # uncalib_img = merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), uncalib)
+            # recalib_img = merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), recalib)
+            # calibgt_img = merge_color_img_with_depth(cv2.cvtColor(cam2, cv2.COLOR_RGB2BGR), calibgt)
 
-    if fout is not None:
-        writer.release()
+            # uncalib_img = cv2.putText(uncalib_img, 'Input', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+            # recalib_img = cv2.putText(recalib_img, 'Pred', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+            # calibgt_img = cv2.putText(calibgt_img, 'GT', (75, 75), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+            # img = np.concatenate([uncalib_img, recalib_img, calibgt_img], axis=0)
+
+            # # save img
+            cv2.imwrite(str(output_dir.joinpath(f'frame_{i:04d}_uncalib.png')), uncalib.permute(1, 2, 0).cpu().numpy())
+            cv2.imwrite(str(output_dir.joinpath(f'frame_{i:04d}_recalib.png')), recalib.permute(1, 2, 0).cpu().numpy())
+            cv2.imwrite(str(output_dir.joinpath(f'frame_{i:04d}_calibgt.png')), calibgt.permute(1, 2, 0).cpu().numpy())
+
+            # Optionally show the image (if needed)
+            # cv2.imshow('Visualization', img)
+            # key = cv2.waitKey(int(1 / 60 * 1000))
+            # if (key & 0xFF == ord('q')) or (key & 0xFF == 27):
+            #     break
+
+    # Optionally release the writer if using video writer
+    # if fout is not None:
+    #     writer.release()
+    # cv2.destroyAllWindows()
+
+    # if fout is not None:
+    #     writer.release()
     # show results
     avg_inference_time = running_time / (i + 1)
     print(f'Running loss: {running_mean:.04f}')
@@ -300,23 +334,31 @@ def run_iterative(models: List[Module], loader: DataLoader, loss_fn: Loss, offse
 def arg_parser():
     parser = argparse.ArgumentParser()
     # common args
-    parser.add_argument('--dataset', type=str, default='/home/username/dataset/KITTI/', help='Model learning rate.')
+    parser.add_argument('--data_folder', type=str, default='/mnt/SSD1/yonglin/datasets/nuscenes', help='KITTI dataset root directory.')
+    parser.add_argument('--prepared_path', type=str, default='/mnt/SSD1/yonglin/datasets/prepared_nuscenes_mini/prepared_data.h5', help='KITTI dataset root directory.')
+    parser.add_argument('--nuscenes_version', type=str, default='v1.0-mini', help='KITTI dataset root directory.')
+    parser.add_argument('--modality', type=str, default='radar', help='KITTI dataset root directory.')
+    parser.add_argument('--max_t', type=float, default=0.25, help='Batch size.')
+    parser.add_argument('--max_r', type=float, default=10, help='Batch size.')
+    parser.add_argument('--max_depth', type=int, default=200, help='Batch size.')
+    parser.add_argument('--downsample_scale', type=int, default=4, help='Batch size.')
+    parser.add_argument('--y_cutoff', type=int, default=33, help='Batch size.')
     parser.add_argument('--model', type=int, default=1, help='Select model variant to test.')
-    parser.add_argument('--loss_a', type=float, default=1.0, help='Loss factor for rotation & translation errors.')
-    parser.add_argument('--loss_b', type=float, default=2.0, help='Loss factor for point cloud center errors.')
-    parser.add_argument('--loss_c', type=float, default=2.0, help='Loss factor for point cloud errors.')
+    parser.add_argument('--loss_a', type=float, default=1.25, help='Loss factor for rotation & translation errors.')
+    parser.add_argument('--loss_b', type=float, default=1.75, help='Loss factor for point cloud center errors.')
+    parser.add_argument('--loss_c', type=float, default=1.0, help='Loss factor for point cloud errors.')
 
     # run visualization task
     parser.add_argument('--visualization', action='store_true', help='Show online running test.')
     parser.add_argument('--ckpt', type=str, help='Path to the saved model in saved folder.')
     parser.add_argument('--rotation_offsest', type=float, default=10.0, help='Random rotation error range.')
-    parser.add_argument('--translation_offsest', type=float, default=0.2, help='Random translation error range.')
+    parser.add_argument('--translation_offsest', type=float, default=0.25, help='Random translation error range.')
 
     # run in iterative mode
     parser.add_argument('--iterative', action='store_true', help='Show online iterative running test.')
     parser.add_argument('--ckpt_list', type=str, help='One or more paths to the saved model in saved folder. The first one will be used first.', nargs='+')
-    parser.add_argument('--rotation_offsests', type=float, default=[10.0, 2.0], help='List of random rotation error range.', nargs='+')
-    parser.add_argument('--translation_offsests', type=float, default=[0.2, 0.2], help='List of random translation error range.', nargs='+')
+    parser.add_argument('--rotation_offsests', type=float, default=[10.0], help='List of random rotation error range.', nargs='+')
+    parser.add_argument('--translation_offsests', type=float, default=[0.25], help='List of random translation error range.', nargs='+')
 
     # output path
     parser.add_argument('--out_path', type=str, help='Path to store the visualized video.')
@@ -331,7 +373,8 @@ if __name__ == '__main__':
     print(args)
 
     # dataset & loss
-    test_ds = CalibDataset(path=args.dataset, mode='test', rotation_offset=args.rotation_offsest, translation_offset=args.translation_offsest)
+    test_ds = DatasetNuscenesCalibNet(args.prepared_path, args.data_folder, "test", 
+                                            args.max_t, args.max_r, args.max_depth, args.downsample_scale, args.y_cutoff, nuscenes_version=args.nuscenes_version, modality=args.modality)
     criteria = Loss(dataset=test_ds, alpha=args.loss_a, beta=args.loss_b, gamma=args.loss_c)
 
     # run

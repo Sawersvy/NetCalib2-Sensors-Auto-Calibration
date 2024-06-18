@@ -186,8 +186,8 @@ def crop_img(img: np.ndarray, h: int, w: int) -> np.ndarray:
 def lidar_projection(scan: np.ndarray, T: np.ndarray, P: np.ndarray, shape: Union[np.ndarray, Tuple[int, int]],
                      R: Optional[np.ndarray] = None, crop: Optional[Union[np.ndarray, Tuple[int, int]]] = None, downscale: int = 1) -> np.ndarray:
     # Reflectance > 0
-    pts3d = scan[scan[:, 3] > 0, :]
-    pts3d[:, 3] = 1
+    pts3d = scan.transpose()
+    # pts3d[:, 3] = 1
 
     # coordinates transformation
     if R is None:

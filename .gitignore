@@ -28,3 +28,7 @@ src/out/
 *.pyc
 
 results/
+
+output/
+
+*.png
